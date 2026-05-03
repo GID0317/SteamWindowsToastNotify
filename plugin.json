@@ -1,0 +1,9 @@
+{
+	"$schema": "https://raw.githubusercontent.com/SteamClientHomebrew/Millennium/main/src/sys/plugin-schema.json",
+
+	"name": "steam-native-toasts",
+	"common_name": "Steam Native Windows Notifications",
+	"description": "Replaces Steam desktop popups with native Windows 11 notification toasts.",
+	"version": "1.0.1",
+	"backendType": "lua"
+}

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.millennium/
+.vscode/
+
+*.log
+*.tmp
+*.ps1
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
