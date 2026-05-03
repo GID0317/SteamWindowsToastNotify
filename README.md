@@ -4,7 +4,7 @@
 
 # Steam Native Windows Notifications
 
-Steam Native Windows Notifications replaces Steam desktop popup notifications with native Windows notifications.
+Steam Native Windows Notifications plugin that replaces Steam desktop popup notifications with native Windows notifications.
 
 ## Features
 
