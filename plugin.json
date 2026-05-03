@@ -3,7 +3,7 @@
 
 	"name": "steam-native-toasts",
 	"common_name": "Steam Native Windows Notifications",
-	"description": "Replaces Steam desktop popup notifications with native Windows notifications.",
+	"description": "Replaces Steam desktop popups with native Windows app notification.",
 	"version": "1.0.0",
 	"backendType": "lua"
 }

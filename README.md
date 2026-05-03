@@ -1,3 +1,7 @@
+<div align="center">
+  <img width="396" height="136" alt="Screenshot 2026-05-03 161435" src="https://github.com/user-attachments/assets/46530e1a-d178-4fcf-8d07-99055ff53072" />
+</div>
+
 # Steam Native Windows Notifications
 
 Steam Native Windows Notifications replaces Steam desktop popup notifications with native Windows notifications.
@@ -7,8 +11,7 @@ Steam Native Windows Notifications replaces Steam desktop popup notifications wi
 - Replaces Steam's desktop notification popups with native Windows notifications.
 - Supports common Steam notifications such as friend messages, group chat messages, friend online alerts, voice chat requests, game invites, download complete alerts, and tutorial prompts.
 - Shows Steam notification actions as Windows notification buttons where available, such as opening chat, joining a game, or dismissing a call.
-- Hide Steam's original popup.
-- Includes settings for enabling the bridge, controlling popup suppression, and Do Not Disturb priority behavior.
+- Includes settings for enabling the bridge, controlling popup suppression, Hide Steam's original popup and Do Not Disturb priority behavior.
 
 ## Windows Support Policy
 
