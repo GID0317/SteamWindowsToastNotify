@@ -1,5 +1,5 @@
 <div align="center">
-  <img width="396" height="187" alt="image" src="https://github.com/user-attachments/assets/3b0edbbd-7e0c-4710-bed9-d14feaa69b14" />
+  <img width="396" height="136" alt="Screenshot 2026-05-03 161435" src="https://github.com/user-attachments/assets/46530e1a-d178-4fcf-8d07-99055ff53072" />
 </div>
 
 # Steam Native Windows Notifications
