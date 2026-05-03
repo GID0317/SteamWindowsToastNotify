@@ -1,6 +1,6 @@
 # Steam Native Windows Notifications
 
-Steam Native Windows Notifications plugin replaces Steam desktop popup notifications with native Windows app notifications.
+Steam Native Windows Notifications replaces Steam desktop popup notifications with native Windows notifications.
 
 ## Features
 
@@ -24,9 +24,10 @@ Older or unsupported Windows versions may have compatibility issues with this pl
 
 - [Millennium](https://github.com/SteamClientHomebrew/Millennium)
 - Windows 10 64-bit version 1607 or later, or Windows 11 22H2 or later (recommended)
-- Node.js 18+
 
 ## Development
+
+Node.js 18+ is needed if you want to build the plugin from source.
 
 ```ps1
 npm install
