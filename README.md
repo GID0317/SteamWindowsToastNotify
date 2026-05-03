@@ -11,8 +11,7 @@ Steam Native Windows Notifications plugin replaces Steam desktop popup notificat
 - Replaces Steam's desktop notification popups with native Windows notifications.
 - Supports common Steam notifications such as friend messages, group chat messages, friend online alerts, voice chat requests, game invites, download complete alerts, and tutorial prompts.
 - Shows Steam notification actions as Windows notification buttons where available, such as opening chat, joining a game, or dismissing a call.
-- Hide Steam's original popup.
-- Includes settings for enabling the bridge, controlling popup suppression, and Do Not Disturb priority behavior.
+- Includes settings for enabling the bridge, controlling popup suppression, Hide Steam's original popup and Do Not Disturb priority behavior.
 
 ## Windows Support Policy
 
