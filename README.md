@@ -1,3 +1,7 @@
+<div align="center">
+  <img width="396" height="187" alt="image" src="https://github.com/user-attachments/assets/3b0edbbd-7e0c-4710-bed9-d14feaa69b14" />
+</div>
+
 # Steam Native Windows Notifications
 
 Steam Native Windows Notifications plugin replaces Steam desktop popup notifications with native Windows app notifications.
