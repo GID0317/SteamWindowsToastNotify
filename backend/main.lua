@@ -211,7 +211,7 @@ local function add_script_location_candidate(candidates)
     end
 
     -- Installed layout:
-    -- %steam%\millennium\plugins\steam-native-toasts\backend\main.lua
+    -- %steam%\millennium\plugins\SteamWindowsToastNotify\backend\main.lua
     local backend_dir = parent_directory(source:sub(2))
     local plugin_dir = parent_directory(backend_dir)
     local plugins_dir = parent_directory(plugin_dir)
@@ -727,7 +727,7 @@ public static class ShortcutHelper {
                 $iconSource = [Uri]::new($iconPath).AbsoluteUri
             } else {
                 try {
-                    Invoke-WebRequest -Uri $iconSource -OutFile $iconPath -UseBasicParsing -TimeoutSec 8 -Headers @{ 'User-Agent' = 'Steam Native Toasts' } | Out-Null
+                    Invoke-WebRequest -Uri $iconSource -OutFile $iconPath -UseBasicParsing -TimeoutSec 8 -Headers @{ 'User-Agent' = 'SteamWindowsToastNotify' } | Out-Null
                     if (Test-Path -LiteralPath $iconPath) {
                         $iconSource = [Uri]::new($iconPath).AbsoluteUri
                     }
@@ -902,16 +902,16 @@ function write_trace_log(arg1)
 end
 
 local function on_load()
-    logger:info("Steam Native Toasts backend loaded")
+    logger:info("SteamWindowsToastNotify backend loaded")
     millennium.ready()
 end
 
 local function on_unload()
-    logger:info("Steam Native Toasts backend unloaded")
+    logger:info("SteamWindowsToastNotify backend unloaded")
 end
 
 local function on_frontend_loaded()
-    logger:info("Steam Native Toasts frontend loaded")
+    logger:info("SteamWindowsToastNotify frontend loaded")
 end
 
 return {

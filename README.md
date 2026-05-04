@@ -2,9 +2,9 @@
   <img width="396" height="136" alt="Screenshot 2026-05-03 161435" src="https://github.com/user-attachments/assets/46530e1a-d178-4fcf-8d07-99055ff53072" />
 </div>
 
-# Steam Native Windows Notifications
+# SteamWindowsToastNotify
 
-Steam Native Windows Notifications replaces Steam desktop popup notifications with native Windows notifications.
+SteamWindowsToastNotify replaces Steam desktop popup notifications with native Windows notifications.
 
 ## Features
 
