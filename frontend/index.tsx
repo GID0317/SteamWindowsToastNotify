@@ -9,6 +9,7 @@ import {
 	EClientNotificationType,
 	sleep,
 } from '@steambrew/client';
+import { useState } from 'react';
 
 type RecordValue = Record<string, unknown>;
 
@@ -4238,28 +4239,11 @@ const ToggleRow = ({
 	description: string;
 	value: boolean;
 	onChange: (next: boolean) => void;
-}) => {
-	const reactApi = (window as unknown as { SP_REACT?: { useState?: <T>(initial: T) => [T, (next: T) => void] } }).SP_REACT;
-	const useState = reactApi?.useState;
-
-	if (!useState) {
-		return null;
-	}
-
-	const [checked, setChecked] = useState<boolean>(value);
-
-	return (
-		<Field label={label} description={description} bottomSeparator="standard" focusable>
-			<Toggle
-				value={checked}
-				onChange={(next: boolean) => {
-					setChecked(next);
-					onChange(next);
-				}}
-			/>
-		</Field>
-	);
-};
+}) => (
+	<Field label={label} description={description} bottomSeparator="standard" focusable>
+		<Toggle value={value} onChange={onChange} />
+	</Field>
+);
 
 const PRIORITY_MODE_OPTIONS = [
 	{ data: PRIORITY_MODE.NONE, label: 'None (Respect DND)' },
@@ -4292,37 +4276,46 @@ const DropdownRow = ({
 	</Field>
 );
 
-const SettingsContent = () => (
+const SettingsContent = () => {
+	const [config, setConfig] = useState<RuntimeConfig>(() => readConfig());
+	const updateConfig = (patch: Partial<RuntimeConfig>): void => {
+		const next = { ...config, ...patch };
+		setConfig(next);
+		writeConfig(next);
+	};
+
+	return (
 	<>
 		<ToggleRow
 			label="Enable Native Toast Bridge"
 			description="Forward Steam notification popups to Windows notifications native toasts."
-			value={runtimeConfig.enabled}
+			value={config.enabled}
 			onChange={(enabled) => {
-				writeConfig({ ...runtimeConfig, enabled });
+				updateConfig({ enabled });
 			}}
 		/>
 		<ToggleRow
 			label="Hide Steam notification Popup"
 			description="Hide Steam's own notification popup after forwarding to Windows notifications native toasts."
-			value={runtimeConfig.hideSteamToast}
+			value={config.hideSteamToast}
 			onChange={(hideSteamToast) => {
-				writeConfig({ ...runtimeConfig, hideSteamToast });
+				updateConfig({ hideSteamToast });
 			}}
 		/>
 		<DropdownRow
 			label="Priority Mode"
 			description="Choose which toasts can bypass Windows Do Not Disturb: none, all, or only important alerts (calls/invites/tutorial prompts)."
-			value={runtimeConfig.priorityMode}
+			value={config.priorityMode}
 			onChange={(priorityMode) => {
-				writeConfig({ ...runtimeConfig, priorityMode });
+				updateConfig({ priorityMode });
 			}}
 		/>
 		<Field label="Test Native Toast" description="Send a sample Windows toast to verify the bridge." bottomSeparator="standard" focusable>
 			<DialogButton onClick={sendTestToast}>Send Test Native Toast</DialogButton>
 		</Field>
 	</>
-);
+	);
+};
 
 export default definePlugin(async () => {
 	void initBridge();

@@ -10,6 +10,7 @@ local MAX_ACTION_LABEL_LENGTH = 64
 local FIELD_SEPARATOR = string.char(31)
 local TOAST_APP_ID = "Steam"
 local ICON_PLACEHOLDER = "__STEAM_NATIVE_TOAST_ICON__"
+local STEAM_ICON_PLACEHOLDER = "__STEAM_NATIVE_TOAST_STEAM_ICON__"
 local DEBUG_MODE = os.getenv("STEAM_NATIVE_TOASTS_DEBUG") == "1"
 
 ffi.cdef[[
@@ -516,9 +517,14 @@ local function build_toast_xml(payload)
     table.insert(xml, '<visual>')
     table.insert(xml, '<binding template="ToastGeneric">')
 
-    if icon then
+    if icon or type_name == "General" or type_name == "DownloadComplete" then
         local icon_source = icon
-        if icon:lower():match("^https?://") then
+        if not icon_source then
+            -- The tiny app badge in Windows' toast header is fixed by the OS.
+            -- For generic Steam alerts, add Steam's own icon as the larger
+            -- toast logo so the notification does not look visually empty.
+            icon_source = STEAM_ICON_PLACEHOLDER
+        elseif icon_source:lower():match("^https?://") then
             icon_source = ICON_PLACEHOLDER
         end
         table.insert(xml, '<image placement="appLogoOverride" hint-crop="circle" src="' .. xml_escape(icon_source) .. '"/>')
@@ -712,9 +718,41 @@ public static class ShortcutHelper {
     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
     [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
 
-    $xml = @"
+$xml = @"
 %s
 "@
+    $steamIconPlaceholder = '%s'
+    if ($xml.Contains($steamIconPlaceholder)) {
+        $steamIconSource = ''
+        if (-not [string]::IsNullOrWhiteSpace($steamExePath) -and (Test-Path -LiteralPath $steamExePath)) {
+            $steamIconPath = Join-Path $env:TEMP 'steam_native_toasts_steam_icon.png'
+            if (-not (Test-Path -LiteralPath $steamIconPath)) {
+                try {
+                    Add-Type -AssemblyName System.Drawing
+                    $steamIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($steamExePath)
+                    if ($null -ne $steamIcon) {
+                        $steamIconBitmap = $steamIcon.ToBitmap()
+                        $steamIconBitmap.Save($steamIconPath, [System.Drawing.Imaging.ImageFormat]::Png)
+                        $steamIconBitmap.Dispose()
+                        $steamIcon.Dispose()
+                    }
+                } catch {
+                    $steamIconSource = ''
+                }
+            }
+            if (Test-Path -LiteralPath $steamIconPath) {
+                $steamIconSource = [Uri]::new($steamIconPath).AbsoluteUri
+            }
+        }
+
+        if ($steamIconSource.Length -gt 0) {
+            $safeSteamIconSource = [System.Security.SecurityElement]::Escape($steamIconSource)
+            $xml = $xml.Replace($steamIconPlaceholder, $safeSteamIconSource)
+        } else {
+            $xml = [regex]::Replace($xml, '<image[^>]+src="' + [regex]::Escape($steamIconPlaceholder) + '"[^>]*/>', '')
+        }
+    }
+
     $iconSource = '%s'
     if ($xml.Contains('%s') -and $iconSource.Length -gt 0) {
         if ($iconSource -match '^https?://') {
@@ -790,6 +828,7 @@ public static class ShortcutHelper {
         escaped_steam_exe,
         TOAST_APP_ID:gsub("'", "''"),
         escaped_xml,
+        STEAM_ICON_PLACEHOLDER,
         escaped_icon_source,
         ICON_PLACEHOLDER,
         ICON_PLACEHOLDER,
