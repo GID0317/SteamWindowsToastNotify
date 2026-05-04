@@ -4294,13 +4294,6 @@ const DropdownRow = ({
 
 const SettingsContent = () => (
 	<>
-		<Field
-			label="SteamWindowsToastNotification"
-			description="Use Windows notifications native toasts for Steam notification popups."
-			icon={<IconsModule.Settings />}
-			bottomSeparator="standard"
-			focusable
-		/>
 		<ToggleRow
 			label="Enable Native Toast Bridge"
 			description="Forward Steam notification popups to Windows notifications native toasts."
