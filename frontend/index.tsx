@@ -4295,7 +4295,7 @@ const DropdownRow = ({
 const SettingsContent = () => (
 	<>
 		<Field
-			label="SteamWindowsToastNotify"
+			label="SteamWindowsToastNotification"
 			description="Use Windows notifications native toasts for Steam notification popups."
 			icon={<IconsModule.Settings />}
 			bottomSeparator="standard"
@@ -4335,7 +4335,7 @@ export default definePlugin(async () => {
 	void initBridge();
 
 	return {
-		title: 'SteamWindowsToastNotify',
+		title: 'SteamWindowsToastNotification',
 		icon: <IconsModule.Settings />,
 		content: <SettingsContent />,
 	};

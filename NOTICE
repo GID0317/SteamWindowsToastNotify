@@ -1,7 +1,7 @@
-SteamWindowsToastNotify
+SteamWindowsToastNotification
 
 This project is distributed under the MIT License. The main implementation is
-maintained by GID and the SteamWindowsToastNotify contributors.
+maintained by GID and the SteamWindowsToastNotification contributors.
 
 This plugin was originally bootstrapped from the Steam Client Homebrew /
 Millennium plugin template and uses the SteamBrew/Millennium APIs. Template,

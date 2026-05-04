@@ -12,11 +12,11 @@
 		"@types/webpack": "^5.28.5"
 	},
 	"type": "module",
-	"name": "steam-windows-toast-notify",
+	"name": "steam-windows-toast-notification",
 	"version": "1.0.0",
 	"description": "Replaces Steam desktop popup notifications with native Windows notifications",
 	"main": "./frontend/index.tsx",
-	"author": "SteamWindowsToastNotify Contributors",
+	"author": "SteamWindowsToastNotification Contributors",
 	"license": "MIT",
 	"dependencies": {
 		"@steambrew/api": "^5.5.3",
