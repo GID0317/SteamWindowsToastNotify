@@ -49,4 +49,4 @@ npm run build
 
 - This plugin keeps things simple and safe by limiting what actions notifications can launch. Only standard links such as steam://, http://, and https:// are supported.
 - All XML content is escaped before the toast payload is created to avoid malformed notifications or unexpected behavior.
-- The plugin also avoids executing any user-provided PowerShell commands. Notification handling stays fully local and does not send data or make network requests through the plugin.
+- The plugin avoids executing any user-provided PowerShell commands. Notification handling stays local, except that notification avatar/icon URLs exposed by Steam may be fetched so Windows can display the same image.

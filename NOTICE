@@ -1,0 +1,9 @@
+Steam Native Windows Notifications
+
+This project is distributed under the MIT License. The main implementation is
+maintained by GID and the Steam Native Windows Notifications contributors.
+
+This plugin was originally bootstrapped from the Steam Client Homebrew /
+Millennium plugin template and uses the SteamBrew/Millennium APIs. Template,
+framework, and dependency materials remain subject to their own upstream
+notices and licenses.
