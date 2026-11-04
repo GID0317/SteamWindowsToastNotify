@@ -161,7 +161,7 @@ const NOTIFICATION_HOST_SELECTOR = [
 	'[data-panel*="notificationtoast" i]',
 ].join(', ');
 const STARTUP_WARMUP_WINDOW_MS = 20_000;
-const TOAST_FORWARD_MIN_GAP_MS = 80;
+const TOAST_FORWARD_MIN_GAP_MS = 0;
 const POPUP_EXTRACTION_RETRY_DELAYS_MS = [90, 150, 220, 320] as const;
 let toastForwardQueue: Promise<void> = Promise.resolve();
 let nextToastForwardEarliestMs = 0;
@@ -335,13 +335,22 @@ const firstNonGenericString = (source: RecordValue | undefined, keys: string[]):
 	return undefined;
 };
 
+const isSupportedImageSource = (value: string | undefined): boolean => {
+	const text = asString(value);
+	if (!text) {
+		return false;
+	}
+
+	return /^(https?:\/\/|data:image\/|file:\/\/)/i.test(text);
+};
+
 const profileImageUrl = (value: unknown): string | undefined => {
 	const text = asString(value);
 	if (!text) {
 		return undefined;
 	}
 
-	return /^https?:\/\//i.test(text) ? text : undefined;
+	return isSupportedImageSource(text) ? text : undefined;
 };
 
 const avatarHashToUrl = (value: unknown): string | undefined => {
@@ -388,7 +397,7 @@ const preferredAvatarUrl = (...candidates: Array<string | undefined>): string | 
 		if (!text) {
 			continue;
 		}
-		if (/^https?:\/\//i.test(text)) {
+		if (isSupportedImageSource(text)) {
 			return text;
 		}
 	}
@@ -2687,7 +2696,7 @@ const extractPopupText = (popup: unknown): PopupExtraction => {
 			if (!src) {
 				continue;
 			}
-			if (/^https?:\/\//i.test(src)) {
+			if (isSupportedImageSource(src)) {
 				icon = src;
 				break;
 			}

@@ -28,14 +28,25 @@ Older or unsupported Windows versions may have compatibility issues with this pl
 - [Millennium](https://github.com/SteamClientHomebrew/Millennium)
 - Windows 10 64-bit version 1607 or later, or Windows 11 22H2 or later (recommended)
 
+## Architecture
+
+Notifications are rendered by a small native helper, `backend/bin/toast-helper.exe`, written in Rust against the `windows` crate:
+
+- The Lua backend builds the toast XML and writes it to the helper over stdin. Notification text is never interpolated into a script, so names and messages containing `$`, quotes, or newlines are just data.
+- The helper loads WinRT once per toast and exits immediately. No PowerShell, execution policy, or temporary script is involved in the normal path.
+- If the helper is missing, the backend falls back to `backend/bin/toast-fallback.ps1`, which reads the XML from a file instead of embedding it in a script.
+- The helper also registers the `Steam` AppUserModelID shortcut once at startup and extracts Steam's icon for generic notifications.
+
 ## Development
 
-Node.js 18+ is needed if you want to build the plugin from source.
+Node.js 18+ and a Rust toolchain with the MSVC target are needed if you want to build the plugin from source.
 
 ```ps1
 npm install
 npm run dev
 ```
+
+`npm run dev` and `npm run build` compile `native/` and copy the helper to `backend/bin/toast-helper.exe` before running Millennium's build.
 
 Use the built plugin from this workspace in your Millennium plugins directory.
 
@@ -47,6 +58,7 @@ npm run build
 
 ## Safety Rules
 
-- This plugin keeps things simple and safe by limiting what actions notifications can launch. Only standard links such as steam://, http://, and https:// are supported.
-- All XML content is escaped before the toast payload is created to avoid malformed notifications or unexpected behavior.
-- The plugin avoids executing any user-provided PowerShell commands. Notification handling stays local, except that notification avatar/icon URLs exposed by Steam may be fetched so Windows can display the same image.
+- Notification XML is passed to the native helper as data over stdin. It is never evaluated as a script, and the text is XML-escaped before it reaches Windows.
+- The PowerShell fallback reads the XML from a file and uses a fixed script with no string interpolation.
+- Only standard links such as `steam://`, `http://`, and `https://` are allowed as notification actions.
+- The plugin avoids executing user-provided content. Notification handling stays local, except that avatar/icon URLs exposed by Steam may be fetched so Windows can display the same image.

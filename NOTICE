@@ -7,3 +7,6 @@ This plugin was originally bootstrapped from the Steam Client Homebrew /
 Millennium plugin template and uses the SteamBrew/Millennium APIs. Template,
 framework, and dependency materials remain subject to their own upstream
 notices and licenses.
+
+The native toast helper in `native/` is built with the `windows` crate, which
+is distributed under the MIT OR Apache-2.0 license.
