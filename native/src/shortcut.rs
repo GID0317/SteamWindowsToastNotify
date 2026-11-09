@@ -2,16 +2,19 @@ use std::path::{Path, PathBuf};
 
 use windows::core::{Interface, Result, GUID, HSTRING, PWSTR};
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
-use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0};
+use windows::Win32::System::Com::StructuredStorage::{
+    PropVariantClear, PropVariantToStringAlloc, PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0,
+};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemAlloc, IPersistFile, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemAlloc, CoTaskMemFree, IPersistFile,
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::IShellLinkW;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 const SHELL_LINK_CLSID: GUID = GUID::from_u128(0x00021401_0000_0000_c000_000000000046);
+const LEGACY_SHORTCUT_NAMES: [&str; 2] = ["Steam Toast Bridge.lnk", "Steam Native Toasts.lnk"];
 
 pub fn ensure(
     app_id: &str,
@@ -23,9 +26,9 @@ pub fn ensure(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_shortcut_path(app_id));
 
-    if let Some(programs) = shortcut.parent() {
-        remove_legacy_shortcuts(programs);
-    }
+    // Legacy cleanup always runs against the standard Start Menu folder, even
+    // when the caller requested a shortcut elsewhere.
+    remove_legacy_shortcuts(&default_programs_dir(), app_id, target);
 
     // Steam already ships this shortcut with the right AUMID. Only create it
     // when it is missing, so user customizations are left untouched.
@@ -81,29 +84,81 @@ pub fn ensure(
     Ok(shortcut)
 }
 
-fn default_shortcut_path(app_id: &str) -> PathBuf {
-    let programs = std::env::var_os("APPDATA")
+fn default_programs_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_default()
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
-        .join("Programs");
+        .join("Programs")
+}
 
+fn default_shortcut_path(app_id: &str) -> PathBuf {
     let file_name = if app_id.eq_ignore_ascii_case("Steam") {
         "Steam.lnk".to_string()
     } else {
         format!("{app_id}.lnk")
     };
 
-    programs.join(file_name)
+    default_programs_dir().join(file_name)
 }
 
-fn remove_legacy_shortcuts(programs: &Path) {
-    for name in ["Steam Toast Bridge.lnk", "Steam Native Toasts.lnk"] {
+fn remove_legacy_shortcuts(programs: &Path, app_id: &str, target: &Path) {
+    for name in LEGACY_SHORTCUT_NAMES {
         let path = programs.join(name);
-        if path.exists() {
+        if !path.exists() {
+            continue;
+        }
+
+        // Only delete a legacy shortcut that still belongs to this plugin.
+        // Anything that cannot be read or points elsewhere is left untouched.
+        if matches!(shortcut_belongs_to(&path, app_id, target), Ok(true)) {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+fn shortcut_belongs_to(path: &Path, app_id: &str, target: &Path) -> Result<bool> {
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+
+        let link: IShellLinkW = CoCreateInstance(&SHELL_LINK_CLSID, None, CLSCTX_INPROC_SERVER)?;
+        let persist: IPersistFile = link.cast()?;
+        persist.Load(&HSTRING::from(path.to_string_lossy().as_ref()), STGM_READ)?;
+
+        let mut target_buffer = [0u16; 1024];
+        if link
+            .GetPath(&mut target_buffer, std::ptr::null_mut(), 0)
+            .is_ok()
+        {
+            let end = target_buffer
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(target_buffer.len());
+            let resolved = String::from_utf16_lossy(&target_buffer[..end]);
+            if paths_equal(Path::new(&resolved), target) {
+                return Ok(true);
+            }
+        }
+
+        let store: IPropertyStore = link.cast()?;
+        let mut value = store.GetValue(&PKEY_AppUserModel_ID)?;
+        let mut matches = false;
+        if let Ok(id) = PropVariantToStringAlloc(&value) {
+            let resolved = id.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(id.as_ptr() as *const _));
+            matches = resolved.eq_ignore_ascii_case(app_id);
+        }
+        let _ = PropVariantClear(&mut value);
+
+        Ok(matches)
+    }
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    let left = left.to_string_lossy().replace('/', "\\");
+    let right = right.to_string_lossy().replace('/', "\\");
+    left.trim_end_matches('\\')
+        .eq_ignore_ascii_case(right.trim_end_matches('\\'))
 }

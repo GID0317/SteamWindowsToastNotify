@@ -91,6 +91,10 @@ local OPEN_EXISTING = 3
 local FILE_ATTRIBUTE_NORMAL = 0x80
 local CP_UTF8 = 65001
 local MAX_COMMAND_LINE_LENGTH = 32767
+local MAX_ICON_DATA_URI_LENGTH = 8 * 1024 * 1024
+local TOAST_HELPER_WAIT_MS = 5000
+local FALLBACK_WAIT_MS = 15000
+local WAIT_TIMEOUT = 258
 local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
 
 local function file_exists(path)
@@ -395,6 +399,10 @@ local function sanitize_icon_source(icon)
 
     local lowered = normalized:lower()
     if lowered:match("^data:image/") then
+        if #normalized > MAX_ICON_DATA_URI_LENGTH then
+            logger:warn("icon data URI rejected size=" .. tostring(#normalized) .. " exceeds limit")
+            return nil
+        end
         return normalized
     end
 
@@ -613,7 +621,7 @@ local function run_process(executable, arguments, stdin_data, wait_ms)
             if kernel32.GetExitCodeProcess(process_info.hProcess, code) ~= 0 then
                 exit_code = tonumber(code[0])
             end
-        else
+        elseif wait_result ~= WAIT_TIMEOUT then
             exit_code = -1
         end
     end
@@ -875,10 +883,20 @@ local function show_fallback_toast(xml)
         log_path
     })
 
-    local ok, detail = run_process(powershell, arguments, nil, 0)
+    local ok, detail = run_process(powershell, arguments, nil, FALLBACK_WAIT_MS)
     if not ok then
         remove_file(xml_path)
         logger:error("PowerShell fallback spawn failed: " .. tostring(detail))
+        return false
+    end
+
+    if detail == nil then
+        logger:warn("PowerShell fallback still running; assuming toast queued")
+        return true
+    end
+
+    if detail ~= 0 then
+        logger:error("PowerShell fallback failed exit_code=" .. tostring(detail) .. " log=" .. tostring(log_path))
         return false
     end
 
@@ -924,13 +942,21 @@ local function show_native_toast(xml, title, body, icon_source)
             table.insert(arguments, steam_icon)
         end
 
-        local ok, detail = run_process(helper, join_arguments(arguments), xml, 0)
+        local ok, detail = run_process(helper, join_arguments(arguments), xml, TOAST_HELPER_WAIT_MS)
         if ok then
-            logger:info("toast queued via native helper")
-            return true
-        end
+            if detail == nil then
+                logger:warn("native helper still running; assuming toast queued")
+                return true
+            end
+            if detail == 0 then
+                logger:info("toast shown via native helper")
+                return true
+            end
 
-        logger:error("native helper spawn failed: " .. tostring(detail))
+            logger:error("native helper failed exit_code=" .. tostring(detail))
+        else
+            logger:error("native helper spawn failed: " .. tostring(detail))
+        end
     end
 
     return show_fallback_toast(xml)

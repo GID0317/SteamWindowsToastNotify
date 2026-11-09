@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$exitCode = 0
 
 try {
     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
@@ -18,6 +19,7 @@ try {
     $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppId)
     $notifier.Show($toast)
 } catch {
+    $exitCode = 1
     if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
         try {
             Set-Content -LiteralPath $LogPath -Value $_.Exception.ToString() -Encoding UTF8
@@ -28,3 +30,5 @@ try {
 } finally {
     Remove-Item -LiteralPath $XmlPath -ErrorAction SilentlyContinue
 }
+
+exit $exitCode

@@ -18,6 +18,13 @@ pub const STEAM_ICON_PLACEHOLDER: &str = "__STEAM_NATIVE_TOAST_STEAM_ICON__";
 // PNG encoder CLSID from gdiplusimaging.h.
 const PNG_ENCODER: GUID = GUID::from_u128(0x557cf406_1a04_11d3_9a73_0000f81ef32e);
 
+// Steam avatars and app icons are small. Treat anything larger as hostile or
+// broken input instead of filling memory or the disk cache.
+const MAX_ICON_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_ICON_BASE64_CHARS: usize = MAX_ICON_BYTES as usize * 4 / 3 + 8;
+const MAX_CACHE_FILES: usize = 200;
+const MAX_CACHE_BYTES: u64 = 50 * 1024 * 1024;
+
 pub fn data_dir() -> PathBuf {
     logging::data_dir()
 }
@@ -132,7 +139,14 @@ fn download_cached(url: &str) -> Option<PathBuf> {
     let name = format!("{:016x}{}", fnv1a64(url.as_bytes()), extension);
     let target = cache.join(name);
     if is_usable(&target) {
-        return Some(target);
+        if std::fs::metadata(&target)
+            .map(|metadata| metadata.len() <= MAX_ICON_BYTES)
+            .unwrap_or(false)
+        {
+            return Some(target);
+        }
+
+        let _ = std::fs::remove_file(&target);
     }
 
     let partial = cache.join(format!("{:016x}.part", fnv1a64(url.as_bytes())));
@@ -152,6 +166,15 @@ fn download_cached(url: &str) -> Option<PathBuf> {
     if result.is_err() || !is_usable(&partial) {
         let _ = std::fs::remove_file(&partial);
         logging::error(&format!("icon download failed for {url}"));
+        return None;
+    }
+
+    let too_large = std::fs::metadata(&partial)
+        .map(|metadata| metadata.len() > MAX_ICON_BYTES)
+        .unwrap_or(true);
+    if too_large {
+        let _ = std::fs::remove_file(&partial);
+        logging::error(&format!("icon download rejected (size limit) for {url}"));
         return None;
     }
 
@@ -183,9 +206,13 @@ fn materialize_data_uri(source: &str) -> Option<PathBuf> {
     if !metadata.to_ascii_lowercase().contains(";base64") {
         return None;
     }
+    if payload.len() > MAX_ICON_BASE64_CHARS {
+        logging::error("inline image rejected: base64 payload exceeds size limit");
+        return None;
+    }
 
     let bytes = decode_base64(payload)?;
-    if bytes.is_empty() {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ICON_BYTES {
         return None;
     }
 
@@ -203,18 +230,17 @@ fn materialize_data_uri(source: &str) -> Option<PathBuf> {
     if is_usable(&path) {
         return Some(path);
     }
-
     std::fs::write(&path, &bytes).ok()?;
+    prune_cache(&cache);
     Some(path)
 }
 
 fn prune_cache(cache: &Path) {
-    const MAX_FILES: usize = 200;
     let Ok(entries) = std::fs::read_dir(cache) else {
         return;
     };
 
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
@@ -222,18 +248,25 @@ fn prune_cache(cache: &Path) {
             if !metadata.is_file() {
                 return None;
             }
-            Some((metadata.modified().ok()?, path))
+            Some((metadata.modified().ok()?, metadata.len(), path))
         })
         .collect();
 
-    if files.len() <= MAX_FILES {
+    let mut total_bytes: u64 = files.iter().map(|(_, size, _)| *size).sum();
+    if files.len() <= MAX_CACHE_FILES && total_bytes <= MAX_CACHE_BYTES {
         return;
     }
 
-    files.sort_by_key(|(modified, _)| *modified);
-    let remove_count = files.len() - MAX_FILES;
-    for (_, path) in files.into_iter().take(remove_count) {
+    files.sort_by_key(|(modified, _, _)| *modified);
+    let mut remaining = files.len();
+    for (_, size, path) in files {
+        if remaining <= MAX_CACHE_FILES && total_bytes <= MAX_CACHE_BYTES {
+            break;
+        }
+
         let _ = std::fs::remove_file(path);
+        remaining -= 1;
+        total_bytes = total_bytes.saturating_sub(size);
     }
 }
 
