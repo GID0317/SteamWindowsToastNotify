@@ -21,6 +21,13 @@ typedef wchar_t* LPWSTR;
 typedef unsigned long DWORD;
 typedef int BOOL;
 typedef unsigned short WORD;
+typedef unsigned int UINT;
+
+typedef struct {
+    DWORD nLength;
+    LPVOID lpSecurityDescriptor;
+    BOOL bInheritHandle;
+} SECURITY_ATTRIBUTES;
 
 typedef struct {
     DWORD cb;
@@ -66,15 +73,29 @@ DWORD __stdcall WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
 BOOL __stdcall GetExitCodeProcess(HANDLE hProcess, DWORD* lpExitCode);
 BOOL __stdcall CloseHandle(HANDLE hObject);
 DWORD __stdcall GetLastError(void);
+BOOL __stdcall CreatePipe(HANDLE* hReadPipe, HANDLE* hWritePipe, SECURITY_ATTRIBUTES* lpPipeAttributes, DWORD nSize);
+BOOL __stdcall SetHandleInformation(HANDLE hObject, DWORD dwMask, DWORD dwFlags);
+BOOL __stdcall WriteFile(HANDLE hFile, const void* lpBuffer, DWORD nNumberOfBytesToWrite, DWORD* lpNumberOfBytesWritten, LPVOID lpOverlapped);
+HANDLE __stdcall CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, SECURITY_ATTRIBUTES* lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+int __stdcall MultiByteToWideChar(UINT CodePage, DWORD dwFlags, const char* lpMultiByteStr, int cbMultiByte, LPWSTR lpWideCharStr, int cchWideChar);
 ]]
 
 local kernel32 = ffi.load("kernel32")
 
-local STARTF_USESHOWWINDOW = 0x00000001
 local CREATE_NO_WINDOW = 0x08000000
-local INFINITE = 0xFFFFFFFF
-local SW_HIDE = 0
-local SW_SHOWNORMAL = 1
+local STARTF_USESTDHANDLES = 0x00000100
+local HANDLE_FLAG_INHERIT = 0x00000001
+local GENERIC_WRITE = 0x40000000
+local FILE_SHARE_READ_WRITE = 0x00000003
+local OPEN_EXISTING = 3
+local FILE_ATTRIBUTE_NORMAL = 0x80
+local CP_UTF8 = 65001
+local MAX_COMMAND_LINE_LENGTH = 32767
+local MAX_ICON_DATA_URI_LENGTH = 8 * 1024 * 1024
+local TOAST_HELPER_WAIT_MS = 5000
+local FALLBACK_WAIT_MS = 15000
+local WAIT_TIMEOUT = 258
+local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
 
 local function file_exists(path)
     if type(path) ~= "string" or path == "" then
@@ -88,6 +109,29 @@ local function file_exists(path)
 
     handle:close()
     return true
+end
+
+local function utf8_safe_truncate(value, max_bytes)
+    if max_bytes <= 0 then
+        return ""
+    end
+    if #value <= max_bytes then
+        return value
+    end
+
+    local cut = max_bytes
+    while cut > 0 do
+        local next_byte = value:byte(cut + 1)
+        if not next_byte or next_byte < 0x80 or next_byte >= 0xC0 then
+            break
+        end
+        cut = cut - 1
+    end
+    return value:sub(1, cut)
+end
+
+local function strip_control_chars(value)
+    return (value:gsub("[%z\1-\31\127]", ""))
 end
 
 local function xml_escape(value)
@@ -108,12 +152,9 @@ local function sanitize_text(value, max_length)
         return ""
     end
 
-    local sanitized = value:gsub("[%z\1-\8\11\12\14-\31]", " ")
-    if #sanitized > max_length then
-        sanitized = sanitized:sub(1, max_length)
-    end
-
-    return sanitized
+    -- Keep tabs and newlines; drop every other control byte that XML rejects.
+    local sanitized = value:gsub("[%z\1-\8\11\12\13\14-\31\127]", " ")
+    return utf8_safe_truncate(sanitized, max_length)
 end
 
 local function simple_hash(value)
@@ -191,11 +232,23 @@ local function join_windows_path(base, child)
     return normalized_base .. "\\" .. child
 end
 
+local function script_directories()
+    -- Calling debug.getinfo through pcall would inspect pcall itself (a C
+    -- function), so call it directly; a valid level never raises.
+    local info = debug.getinfo(1, "S")
+    local source = info and info.source or nil
+    if type(source) ~= "string" or source:sub(1, 1) ~= "@" then
+        return nil, nil
+    end
+
+    local backend_dir = parent_directory(source:sub(2))
+    local plugin_dir = parent_directory(backend_dir)
+    return backend_dir, plugin_dir
+end
+
 local function add_steam_exe_candidate(candidates, path, source)
     local normalized = normalize_windows_path(path)
     if normalized and file_exists(normalized) then
-        -- Only keep paths Lua can open. PowerShell gets a finished answer,
-        -- not a list of guesses to resolve during toast delivery.
         table.insert(candidates, { path = normalized, source = source })
     end
 end
@@ -204,31 +257,22 @@ local function add_steam_dir_candidate(candidates, dir, source)
     add_steam_exe_candidate(candidates, join_windows_path(dir, "Steam.exe"), source)
 end
 
-local function add_script_location_candidate(candidates)
-    local ok, info = pcall(debug.getinfo, 1, "S")
-    local source = ok and info and info.source or nil
-    if type(source) ~= "string" or source:sub(1, 1) ~= "@" then
-        return
-    end
+local cached_steam_exe
+local steam_lookup_done = false
 
-    -- Installed layout:
-    -- %steam%\millennium\plugins\SteamWindowsToastNotification\backend\main.lua
-    local backend_dir = parent_directory(source:sub(2))
-    local plugin_dir = parent_directory(backend_dir)
-    local plugins_dir = parent_directory(plugin_dir)
-    local millennium_dir = parent_directory(plugins_dir)
-    local steam_dir = parent_directory(millennium_dir)
-    add_steam_dir_candidate(candidates, steam_dir, "plugin_path")
-end
-
--- Resolve Steam from Millennium/Lua, not from the PowerShell toast script.
--- The previous PowerShell shortcut/registry resolver was fragile at startup,
--- so new discovery sources should be added here and guarded with pcall.
+-- Resolve Steam once per session. The path never changes while Steam is running,
+-- and looking it up on every toast only adds disk I/O to the send path.
 local function resolve_steam_exe_path()
+    if cached_steam_exe then
+        return cached_steam_exe
+    end
+    if steam_lookup_done then
+        return nil
+    end
+    steam_lookup_done = true
+
     local candidates = {}
 
-    -- SteamBrew exposes the Steam install directory; this avoids hardcoding
-    -- the user's drive while keeping PowerShell out of path discovery.
     local ok, steam_path = pcall(millennium.steam_path)
     if ok then
         add_steam_dir_candidate(candidates, steam_path, "millennium.steam_path")
@@ -242,7 +286,14 @@ local function resolve_steam_exe_path()
         add_steam_dir_candidate(candidates, parent_directory(install_path), "millennium.get_install_path_parent")
     end
 
-    add_script_location_candidate(candidates)
+    local backend_dir, plugin_dir = script_directories()
+    if backend_dir and plugin_dir then
+        local plugins_dir = parent_directory(plugin_dir)
+        local millennium_dir = parent_directory(plugins_dir)
+        local steam_dir = parent_directory(millennium_dir)
+        add_steam_dir_candidate(candidates, steam_dir, "plugin_path")
+    end
+
     add_steam_dir_candidate(candidates, os.getenv("STEAM_PATH"), "env.STEAM_PATH")
     add_steam_dir_candidate(candidates, os.getenv("STEAM_DIR"), "env.STEAM_DIR")
     add_steam_exe_candidate(candidates, "C:\\Program Files (x86)\\Steam\\Steam.exe", "default_install")
@@ -255,10 +306,66 @@ local function resolve_steam_exe_path()
                 .. " path="
                 .. summarize_log_text(selected.path, 160)
         )
-        return selected.path
+        cached_steam_exe = selected.path
+        return cached_steam_exe
     end
 
     logger:info("resolved_steam_exe source=none")
+    return nil
+end
+
+local cached_helper_path
+local helper_lookup_done = false
+
+local function resolve_helper_path()
+    if helper_lookup_done then
+        return cached_helper_path
+    end
+    helper_lookup_done = true
+
+    local backend_dir, plugin_dir = script_directories()
+    local candidates = {}
+
+    if backend_dir then
+        table.insert(candidates, backend_dir .. "\\bin\\toast-helper.exe")
+    end
+    if plugin_dir then
+        table.insert(candidates, plugin_dir .. "\\backend\\bin\\toast-helper.exe")
+        table.insert(candidates, plugin_dir .. "\\bin\\toast-helper.exe")
+    end
+
+    for _, candidate in ipairs(candidates) do
+        if file_exists(candidate) then
+            cached_helper_path = candidate
+            logger:info("toast helper resolved path=" .. summarize_log_text(candidate, 160))
+            return cached_helper_path
+        end
+    end
+
+    logger:warn("toast helper not found; PowerShell fallback will be used")
+    return nil
+end
+
+local cached_fallback_script
+local fallback_lookup_done = false
+
+local function resolve_fallback_script()
+    if fallback_lookup_done then
+        return cached_fallback_script
+    end
+    fallback_lookup_done = true
+
+    local backend_dir = script_directories()
+    if not backend_dir then
+        return nil
+    end
+
+    local path = backend_dir .. "\\bin\\toast-fallback.ps1"
+    if file_exists(path) then
+        cached_fallback_script = path
+        return cached_fallback_script
+    end
+
     return nil
 end
 
@@ -267,7 +374,7 @@ local function sanitize_protocol_url(url)
         return nil
     end
 
-    local normalized = url:match("^%s*(.-)%s*$")
+    local normalized = strip_control_chars(url):match("^%s*(.-)%s*$")
     if normalized == "" then
         return nil
     end
@@ -285,13 +392,17 @@ local function sanitize_icon_source(icon)
         return nil
     end
 
-    local normalized = icon:match("^%s*(.-)%s*$")
+    local normalized = strip_control_chars(icon):match("^%s*(.-)%s*$")
     if normalized == "" then
         return nil
     end
 
     local lowered = normalized:lower()
     if lowered:match("^data:image/") then
+        if #normalized > MAX_ICON_DATA_URI_LENGTH then
+            logger:warn("icon data URI rejected size=" .. tostring(#normalized) .. " exceeds limit")
+            return nil
+        end
         return normalized
     end
 
@@ -332,31 +443,146 @@ end
 
 local function to_wide(value)
     local text = tostring(value or "")
-    local buffer = ffi.new("wchar_t[?]", #text + 1)
-    for i = 1, #text do
-        buffer[i - 1] = string.byte(text, i)
+    local length = #text
+    if length == 0 then
+        return ffi.new("wchar_t[1]", 0)
     end
-    buffer[#text] = 0
+
+    local needed = kernel32.MultiByteToWideChar(CP_UTF8, 0, text, length, nil, 0)
+    if needed <= 0 then
+        return nil
+    end
+
+    local buffer = ffi.new("wchar_t[?]", needed + 1)
+    kernel32.MultiByteToWideChar(CP_UTF8, 0, text, length, buffer, needed)
+    buffer[needed] = 0
     return buffer
 end
 
-local function run_hidden_process(executable, arguments)
+local function quote_arg(value)
+    local text = tostring(value or "")
+    if text == "" then
+        return '""'
+    end
+    if not text:find('[%s"]') then
+        return text
+    end
+
+    local output = { '"' }
+    local backslashes = 0
+
+    for index = 1, #text do
+        local char = text:sub(index, index)
+        if char == "\\" then
+            backslashes = backslashes + 1
+        elseif char == '"' then
+            table.insert(output, string.rep("\\", backslashes * 2 + 1))
+            table.insert(output, '"')
+            backslashes = 0
+        else
+            if backslashes > 0 then
+                table.insert(output, string.rep("\\", backslashes))
+                backslashes = 0
+            end
+            table.insert(output, char)
+        end
+    end
+
+    if backslashes > 0 then
+        table.insert(output, string.rep("\\", backslashes * 2))
+    end
+    table.insert(output, '"')
+    return table.concat(output)
+end
+
+local function join_arguments(arguments)
+    local parts = {}
+    for _, argument in ipairs(arguments) do
+        table.insert(parts, quote_arg(argument))
+    end
+    return table.concat(parts, " ")
+end
+
+-- Spawn a process without a console window.
+-- stdin_data is written through an anonymous pipe and the pipe is closed, so the
+-- child sees EOF. wait_ms = 0 means fire-and-forget.
+local function run_process(executable, arguments, stdin_data, wait_ms)
+    local executable_wide = to_wide(executable)
+    if not executable_wide then
+        return false, "utf8 conversion failed"
+    end
+
+    local command_line = '"' .. executable .. '"'
+    if arguments and #arguments > 0 then
+        command_line = command_line .. " " .. arguments
+    end
+    if #command_line > MAX_COMMAND_LINE_LENGTH then
+        return false, "command line too long"
+    end
+
+    local command_line_wide = to_wide(command_line)
+    if not command_line_wide then
+        return false, "utf8 conversion failed"
+    end
+
     local startup_info = ffi.new("STARTUPINFOW")
     startup_info.cb = ffi.sizeof(startup_info)
-    startup_info.dwFlags = STARTF_USESHOWWINDOW
-    startup_info.wShowWindow = DEBUG_MODE and SW_SHOWNORMAL or SW_HIDE
+
+    local read_end
+    local write_end
+    local nul_handle
+    local inherit_handles = 0
+
+    if stdin_data then
+        local attributes = ffi.new("SECURITY_ATTRIBUTES")
+        attributes.nLength = ffi.sizeof(attributes)
+        attributes.lpSecurityDescriptor = nil
+        attributes.bInheritHandle = 1
+
+        local read_pointer = ffi.new("HANDLE[1]")
+        local write_pointer = ffi.new("HANDLE[1]")
+        if kernel32.CreatePipe(read_pointer, write_pointer, attributes, 262144) == 0 then
+            return false, "CreatePipe failed: " .. tostring(tonumber(kernel32.GetLastError()))
+        end
+
+        read_end = read_pointer[0]
+        write_end = write_pointer[0]
+        kernel32.SetHandleInformation(write_end, HANDLE_FLAG_INHERIT, 0)
+        inherit_handles = 1
+
+        local nul_attributes = ffi.new("SECURITY_ATTRIBUTES")
+        nul_attributes.nLength = ffi.sizeof(nul_attributes)
+        nul_attributes.lpSecurityDescriptor = nil
+        nul_attributes.bInheritHandle = 1
+
+        local nul_name = to_wide("\\\\.\\NUL")
+        nul_handle = kernel32.CreateFileW(
+            nul_name,
+            GENERIC_WRITE,
+            FILE_SHARE_READ_WRITE,
+            nul_attributes,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nil
+        )
+        if nul_handle == INVALID_HANDLE_VALUE then
+            nul_handle = nil
+        end
+
+        startup_info.dwFlags = STARTF_USESTDHANDLES
+        startup_info.hStdInput = read_end
+        startup_info.hStdOutput = nul_handle
+        startup_info.hStdError = nul_handle
+    end
 
     local process_info = ffi.new("PROCESS_INFORMATION")
-    local command_line = '"' .. executable .. '" ' .. arguments
-    local creation_flags = DEBUG_MODE and 0 or CREATE_NO_WINDOW
-
     local created = kernel32.CreateProcessW(
-        to_wide(executable),
-        to_wide(command_line),
+        executable_wide,
+        command_line_wide,
         nil,
         nil,
-        0,
-        creation_flags,
+        inherit_handles,
+        CREATE_NO_WINDOW,
         nil,
         nil,
         startup_info,
@@ -364,25 +590,49 @@ local function run_hidden_process(executable, arguments)
     )
 
     if created == 0 then
-        return false, "CreateProcessW failed with error " .. tostring(tonumber(kernel32.GetLastError()))
+        local error_code = tonumber(kernel32.GetLastError())
+        if read_end then
+            kernel32.CloseHandle(read_end)
+        end
+        if write_end then
+            kernel32.CloseHandle(write_end)
+        end
+        if nul_handle then
+            kernel32.CloseHandle(nul_handle)
+        end
+        return false, "CreateProcessW failed: " .. tostring(error_code)
     end
 
-    kernel32.WaitForSingleObject(process_info.hProcess, INFINITE)
+    if read_end then
+        kernel32.CloseHandle(read_end)
+    end
 
-    local exit_code = ffi.new("DWORD[1]", 0)
-    if kernel32.GetExitCodeProcess(process_info.hProcess, exit_code) == 0 then
-        kernel32.CloseHandle(process_info.hThread)
-        kernel32.CloseHandle(process_info.hProcess)
-        return false, "GetExitCodeProcess failed with error " .. tostring(tonumber(kernel32.GetLastError()))
+    if stdin_data and write_end then
+        local written = ffi.new("DWORD[1]", 0)
+        kernel32.WriteFile(write_end, ffi.cast("const char*", stdin_data), #stdin_data, written, nil)
+        kernel32.CloseHandle(write_end)
+    end
+
+    local exit_code
+    if wait_ms and wait_ms > 0 then
+        local wait_result = kernel32.WaitForSingleObject(process_info.hProcess, wait_ms)
+        if wait_result == 0 then
+            local code = ffi.new("DWORD[1]", 0)
+            if kernel32.GetExitCodeProcess(process_info.hProcess, code) ~= 0 then
+                exit_code = tonumber(code[0])
+            end
+        elseif wait_result ~= WAIT_TIMEOUT then
+            exit_code = -1
+        end
     end
 
     kernel32.CloseHandle(process_info.hThread)
     kernel32.CloseHandle(process_info.hProcess)
-    return tonumber(exit_code[0]) == 0, tonumber(exit_code[0])
-end
+    if nul_handle then
+        kernel32.CloseHandle(nul_handle)
+    end
 
-local function os_execute_success(result)
-    return result == true or result == 0
+    return true, exit_code
 end
 
 local function split_blob(blob)
@@ -406,39 +656,29 @@ local function split_blob(blob)
     return fields
 end
 
+local function payload_from_fields(fields)
+    return {
+        typeName = fields[1],
+        title = fields[2],
+        body = fields[3],
+        icon = fields[4],
+        launchUrl = fields[5],
+        playSound = fields[6] ~= "0",
+        actionLabel = fields[7],
+        actionUrl = fields[8],
+        debugTraceId = fields[9],
+        debugSource = fields[10],
+        bypassDoNotDisturb = fields[11] == "1"
+    }
+end
+
 local function normalize_payload(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
     if type(arg1) == "table" and type(arg1.payload_blob) == "string" then
-        local fields = split_blob(arg1.payload_blob)
-        return {
-            typeName = fields[1],
-            title = fields[2],
-            body = fields[3],
-            icon = fields[4],
-            launchUrl = fields[5],
-            playSound = fields[6] ~= "0",
-            actionLabel = fields[7],
-            actionUrl = fields[8],
-            debugTraceId = fields[9],
-            debugSource = fields[10],
-            bypassDoNotDisturb = fields[11] == "1"
-        }
+        return payload_from_fields(split_blob(arg1.payload_blob))
     end
 
     if type(arg1) == "string" and arg2 == nil and arg1:find(FIELD_SEPARATOR, 1, true) then
-        local fields = split_blob(arg1)
-        return {
-            typeName = fields[1],
-            title = fields[2],
-            body = fields[3],
-            icon = fields[4],
-            launchUrl = fields[5],
-            playSound = fields[6] ~= "0",
-            actionLabel = fields[7],
-            actionUrl = fields[8],
-            debugTraceId = fields[9],
-            debugSource = fields[10],
-            bypassDoNotDisturb = fields[11] == "1"
-        }
+        return payload_from_fields(split_blob(arg1))
     end
 
     return {
@@ -467,8 +707,6 @@ local function build_toast_xml(payload)
     local scenario_attr = ""
 
     if use_priority_bypass then
-        -- Calls have their own Windows scenario. Using urgent here makes the
-        -- buttons behave like a generic priority alert instead of a call.
         if is_incoming_voice then
             scenario_attr = ' scenario="incomingCall"'
         else
@@ -513,62 +751,157 @@ local function build_toast_xml(payload)
     local xml = {}
     local launch_attr = launch_url and (' launch="' .. xml_escape(launch_url) .. '" activationType="protocol"') or ""
 
-    table.insert(xml, '<toast' .. launch_attr .. scenario_attr .. '>')
-    table.insert(xml, '<visual>')
+    table.insert(xml, "<toast" .. launch_attr .. scenario_attr .. ">")
+    table.insert(xml, "<visual>")
     table.insert(xml, '<binding template="ToastGeneric">')
 
     if icon or type_name == "General" or type_name == "DownloadComplete" then
-        local icon_source = icon
-        if not icon_source then
-            -- The tiny app badge in Windows' toast header is fixed by the OS.
-            -- For generic Steam alerts, add Steam's own icon as the larger
-            -- toast logo so the notification does not look visually empty.
+        local icon_source
+        if icon then
+            -- Data URIs can be hundreds of kilobytes, so embed them in the XML
+            -- instead of passing them on the command line.
+            if icon:lower():match("^data:image/") then
+                icon_source = icon
+            else
+                icon_source = ICON_PLACEHOLDER
+            end
+        else
             icon_source = STEAM_ICON_PLACEHOLDER
-        elseif icon_source:lower():match("^https?://") then
-            icon_source = ICON_PLACEHOLDER
         end
         table.insert(xml, '<image placement="appLogoOverride" hint-crop="circle" src="' .. xml_escape(icon_source) .. '"/>')
     end
 
     if title ~= "" then
-        table.insert(xml, '<text>' .. xml_escape(title) .. '</text>')
+        table.insert(xml, "<text>" .. xml_escape(title) .. "</text>")
     end
     if body ~= "" then
-        table.insert(xml, '<text>' .. xml_escape(body) .. '</text>')
+        table.insert(xml, "<text>" .. xml_escape(body) .. "</text>")
     end
-    table.insert(xml, '</binding>')
-    table.insert(xml, '</visual>')
+    table.insert(xml, "</binding>")
+    table.insert(xml, "</visual>")
 
     if #actions > 0 then
-        table.insert(xml, '<actions>')
+        table.insert(xml, "<actions>")
         for _, action in ipairs(actions) do
             table.insert(
                 xml,
-                '<action content="' .. xml_escape(action.label) .. '" activationType="protocol" arguments="' .. xml_escape(action.url) .. '"/>'
+                '<action content="'
+                    .. xml_escape(action.label)
+                    .. '" activationType="protocol" arguments="'
+                    .. xml_escape(action.url)
+                    .. '"/>'
             )
         end
         if is_incoming_voice then
-            -- Voice toasts should keep a compact two-button layout:
-            -- one app action and one system dismiss action.
-            table.insert(
-                xml,
-                '<action content="Dismiss" activationType="system" arguments="dismiss"/>'
-            )
+            table.insert(xml, '<action content="Dismiss" activationType="system" arguments="dismiss"/>')
         elseif is_friend_in_game then
-            table.insert(
-                xml,
-                '<action content="Ignore" activationType="system" arguments="dismiss"/>'
-            )
+            table.insert(xml, '<action content="Ignore" activationType="system" arguments="dismiss"/>')
         end
-        table.insert(xml, '</actions>')
+        table.insert(xml, "</actions>")
     end
 
     if not play_sound then
         table.insert(xml, '<audio silent="true"/>')
     end
 
-    table.insert(xml, '</toast>')
+    table.insert(xml, "</toast>")
     return table.concat(xml)
+end
+
+local function steam_icon_path()
+    local base = os.getenv("LOCALAPPDATA") or os.getenv("TEMP") or "."
+    return base .. "\\SteamWindowsToastNotification\\steam.png"
+end
+
+local function remove_image_element_containing(xml, needle)
+    local result = xml
+    while true do
+        local position = result:find(needle, 1, true)
+        if not position then
+            break
+        end
+
+        local start_position
+        local search_index = 1
+        while true do
+            local candidate = result:find("<image", search_index, true)
+            if not candidate or candidate > position then
+                break
+            end
+            start_position = candidate
+            search_index = candidate + 1
+        end
+
+        local end_position = result:find("/>", position, true)
+        if not start_position or not end_position then
+            break
+        end
+
+        result = result:sub(1, start_position - 1) .. result:sub(end_position + 2)
+    end
+
+    return result
+end
+
+local function show_fallback_toast(xml)
+    local fallback_script = resolve_fallback_script()
+    if not fallback_script then
+        logger:error("No toast backend available: helper and fallback script are missing")
+        return false
+    end
+
+    local sanitized_xml = remove_image_element_containing(xml, ICON_PLACEHOLDER)
+    sanitized_xml = remove_image_element_containing(sanitized_xml, STEAM_ICON_PLACEHOLDER)
+    sanitized_xml = remove_image_element_containing(sanitized_xml, 'src="data:image/')
+
+    local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
+    local suffix = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+    local xml_path = temp_dir .. "\\steam_native_toast_" .. suffix .. ".xml"
+    local log_path = temp_dir .. "\\steam_native_toast_fallback.log"
+
+    if not write_file(xml_path, sanitized_xml, false) then
+        logger:error("Failed to write fallback toast payload")
+        return false
+    end
+
+    local powershell = (os.getenv("SystemRoot") or "C:\\Windows")
+        .. "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    local arguments = join_arguments({
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        fallback_script,
+        "-XmlPath",
+        xml_path,
+        "-AppId",
+        TOAST_APP_ID,
+        "-LogPath",
+        log_path
+    })
+
+    local ok, detail = run_process(powershell, arguments, nil, FALLBACK_WAIT_MS)
+    if not ok then
+        remove_file(xml_path)
+        logger:error("PowerShell fallback spawn failed: " .. tostring(detail))
+        return false
+    end
+
+    if detail == nil then
+        logger:warn("PowerShell fallback still running; assuming toast queued")
+        return true
+    end
+
+    if detail ~= 0 then
+        logger:error("PowerShell fallback failed exit_code=" .. tostring(detail) .. " log=" .. tostring(log_path))
+        return false
+    end
+
+    logger:warn("toast queued via PowerShell fallback")
+    return true
 end
 
 local function show_native_toast(xml, title, body, icon_source)
@@ -578,320 +911,55 @@ local function show_native_toast(xml, title, body, icon_source)
             .. " body="
             .. summarize_log_text(body or "", 120)
     )
-    local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
-    local suffix = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
-    local ps1_path = temp_dir .. "\\steam_native_toasts_" .. suffix .. ".ps1"
-    local log_path = temp_dir .. "\\steam_native_toasts_" .. suffix .. ".log"
 
-    local escaped_ps1_path = ps1_path:gsub("'", "''")
-    local escaped_log_path = log_path:gsub("'", "''")
-    local escaped_title = sanitize_text(title or "Steam Notification", MAX_TITLE_LENGTH):gsub("'", "''")
-    local escaped_body = sanitize_text(body or "You have a new Steam notification.", MAX_BODY_LENGTH):gsub("'", "''")
-    local escaped_xml = xml:gsub("'", "''")
-    local escaped_icon_source = sanitize_icon_source(icon_source or "") or ""
-    escaped_icon_source = escaped_icon_source:gsub("'", "''")
-    local steam_exe_path = resolve_steam_exe_path() or ""
-    local escaped_steam_exe = steam_exe_path:gsub("'", "''")
-    local ps_script = ([[
-$ErrorActionPreference = 'Stop'
-try {
-    $programsPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
-    $shortcutPath = Join-Path $programsPath 'Steam.lnk'
-    $steamExePath = '%s'
-    $legacyShortcutPaths = @(
-        (Join-Path $programsPath 'Steam Toast Bridge.lnk'),
-        (Join-Path $programsPath 'Steam Native Toasts.lnk')
-    )
-    # Keep this script focused on Windows toast identity and delivery.
-    # Steam path discovery already happened in Lua before this script was built.
-    $needsShortcutSetup = (-not [string]::IsNullOrWhiteSpace($steamExePath)) -and (-not (Test-Path -LiteralPath $shortcutPath))
-    foreach ($legacyShortcutPath in $legacyShortcutPaths) {
-        if (Test-Path -LiteralPath $legacyShortcutPath) {
-            Remove-Item -LiteralPath $legacyShortcutPath -Force -ErrorAction SilentlyContinue
-            $needsShortcutSetup = $true
-        }
-    }
+    local helper = resolve_helper_path()
+    if helper then
+        local arguments = { "show", "--app-id", TOAST_APP_ID }
 
-    if ($needsShortcutSetup -and -not ('ShortcutHelper' -as [type])) {
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.ComTypes;
-using System.Text;
-
-[ComImport]
-[Guid("00021401-0000-0000-C000-000000000046")]
-class ShellLink {}
-
-[ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
-interface IShellLinkW {
-    void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cchMaxPath, IntPtr pfd, int fFlags);
-    void GetIDList(out IntPtr ppidl);
-    void SetIDList(IntPtr pidl);
-    void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName, int cchMaxName);
-    void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
-    void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszDir, int cchMaxPath);
-    void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
-    void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszArgs, int cchMaxPath);
-    void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
-    void GetHotkey(out short pwHotkey);
-    void SetHotkey(short wHotkey);
-    void GetShowCmd(out int piShowCmd);
-    void SetShowCmd(int iShowCmd);
-    void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszIconPath, int cchIconPath, out int piIcon);
-    void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string pszIconPath, int iIcon);
-    void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, int dwReserved);
-    void Resolve(IntPtr hwnd, int fFlags);
-    void SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
-}
-
-[ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
-interface IPropertyStore {
-    uint GetCount(out uint cProps);
-    uint GetAt(uint iProp, out PROPERTYKEY pkey);
-    uint GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
-    uint SetValue(ref PROPERTYKEY key, ref PROPVARIANT pv);
-    uint Commit();
-}
-
-[ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("0000010b-0000-0000-C000-000000000046")]
-interface IPersistFile {
-    void GetClassID(out Guid pClassID);
-    [PreserveSig] int IsDirty();
-    void Load([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, uint dwMode);
-    void Save([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, bool fRemember);
-    void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string pszFileName);
-    void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
-}
-
-[StructLayout(LayoutKind.Sequential, Pack = 4)]
-struct PROPERTYKEY {
-    public Guid fmtid;
-    public uint pid;
-}
-
-[StructLayout(LayoutKind.Explicit)]
-struct PROPVARIANT {
-    [FieldOffset(0)] public ushort vt;
-    [FieldOffset(8)] public IntPtr pwszVal;
-}
-
-public static class ShortcutHelper {
-    public static void EnsureShortcut(string shortcutPath, string exePath, string appId) {
-        var link = (IShellLinkW)new ShellLink();
-        link.SetPath(exePath);
-        link.SetArguments("");
-        link.SetDescription("Steam");
-        link.SetIconLocation(exePath, 0);
-
-        var propertyStore = (IPropertyStore)link;
-        var appIdKey = new PROPERTYKEY {
-            fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"),
-            pid = 5
-        };
-        var appIdValue = new PROPVARIANT {
-            vt = 31,
-            pwszVal = Marshal.StringToCoTaskMemUni(appId)
-        };
-
-        try {
-            uint hr = propertyStore.SetValue(ref appIdKey, ref appIdValue);
-            if (hr != 0) Marshal.ThrowExceptionForHR((int)hr);
-            hr = propertyStore.Commit();
-            if (hr != 0) Marshal.ThrowExceptionForHR((int)hr);
-            ((IPersistFile)link).Save(shortcutPath, true);
-        } finally {
-            if (appIdValue.pwszVal != IntPtr.Zero) {
-                Marshal.FreeCoTaskMem(appIdValue.pwszVal);
-            }
-        }
-    }
-}
-"@
-    }
-
-    if ($needsShortcutSetup) {
-        [ShortcutHelper]::EnsureShortcut($shortcutPath, $steamExePath, '%s')
-    }
-
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime
-    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
-    [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
-
-$xml = @"
-%s
-"@
-    $steamIconPlaceholder = '%s'
-    if ($xml.Contains($steamIconPlaceholder)) {
-        $steamIconSource = ''
-        if (-not [string]::IsNullOrWhiteSpace($steamExePath) -and (Test-Path -LiteralPath $steamExePath)) {
-            $steamIconPath = Join-Path $env:TEMP 'steam_native_toasts_steam_icon.png'
-            if (-not (Test-Path -LiteralPath $steamIconPath)) {
-                try {
-                    Add-Type -AssemblyName System.Drawing
-                    $steamIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($steamExePath)
-                    if ($null -ne $steamIcon) {
-                        $steamIconBitmap = $steamIcon.ToBitmap()
-                        $steamIconBitmap.Save($steamIconPath, [System.Drawing.Imaging.ImageFormat]::Png)
-                        $steamIconBitmap.Dispose()
-                        $steamIcon.Dispose()
-                    }
-                } catch {
-                    $steamIconSource = ''
-                }
-            }
-            if (Test-Path -LiteralPath $steamIconPath) {
-                $steamIconSource = [Uri]::new($steamIconPath).AbsoluteUri
-            }
-        }
-
-        if ($steamIconSource.Length -gt 0) {
-            $safeSteamIconSource = [System.Security.SecurityElement]::Escape($steamIconSource)
-            $xml = $xml.Replace($steamIconPlaceholder, $safeSteamIconSource)
-        } else {
-            $xml = [regex]::Replace($xml, '<image[^>]+src="' + [regex]::Escape($steamIconPlaceholder) + '"[^>]*/>', '')
-        }
-    }
-
-    $iconSource = '%s'
-    if ($xml.Contains('%s') -and $iconSource.Length -gt 0) {
-        if ($iconSource -match '^https?://') {
-            $extension = [System.IO.Path]::GetExtension(([Uri]$iconSource).AbsolutePath)
-            if ([string]::IsNullOrWhiteSpace($extension)) {
-                $extension = '.png'
-            }
-            $iconPath = Join-Path $env:TEMP ('steam_native_toasts_icon_' + [Math]::Abs($iconSource.GetHashCode()) + $extension)
-            if (Test-Path -LiteralPath $iconPath) {
-                $iconSource = [Uri]::new($iconPath).AbsoluteUri
-            } else {
-                try {
-                    Invoke-WebRequest -Uri $iconSource -OutFile $iconPath -UseBasicParsing -TimeoutSec 8 -Headers @{ 'User-Agent' = 'SteamWindowsToastNotification' } | Out-Null
-                    if (Test-Path -LiteralPath $iconPath) {
-                        $iconSource = [Uri]::new($iconPath).AbsoluteUri
-                    }
-                } catch {
-                    # Keep original remote URL as a final fallback.
-                }
-            }
-        } elseif (Test-Path -LiteralPath $iconSource) {
-            $iconSource = [Uri]::new($iconSource).AbsoluteUri
-        }
-
-        if ($iconSource.Length -gt 0) {
-            $safeIconSource = [System.Security.SecurityElement]::Escape($iconSource)
-            $xml = $xml.Replace('%s', $safeIconSource)
-        } else {
-            $xml = [regex]::Replace($xml, '<image[^>]+src="' + [regex]::Escape('%s') + '"[^>]*/>', '')
-        }
-    }
-
-    $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
-    $doc.LoadXml($xml)
-
-    $toast = [Windows.UI.Notifications.ToastNotification]::new($doc)
-    $notifier = $null
-    try {
-        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('%s')
-    } catch {
-        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier()
-    }
-    $notifier.Show($toast)
-
-    Set-Content -LiteralPath '%s' -Value 'success:toast'
-    exit 0
-} catch {
-    try {
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type -AssemblyName System.Drawing
-
-        $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
-        $notifyIcon.Icon = [System.Drawing.SystemIcons]::Application
-        $notifyIcon.Visible = $true
-        $notifyIcon.Text = '%s'
-        $notifyIcon.BalloonTipTitle = '%s'
-        $notifyIcon.BalloonTipText = '%s'
-        $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::None
-        $notifyIcon.ShowBalloonTip(5000)
-        Start-Sleep -Milliseconds 6000
-        $notifyIcon.Dispose()
-
-        Set-Content -LiteralPath '%s' -Value ('success:fallback ' + $_.Exception.ToString())
-        exit 0
-    } catch {
-        Set-Content -LiteralPath '%s' -Value ($_.Exception.ToString())
-        exit 1
-    }
-} finally {
-    Remove-Item -LiteralPath '%s' -ErrorAction SilentlyContinue
-}
-]]):format(
-        escaped_steam_exe,
-        TOAST_APP_ID:gsub("'", "''"),
-        escaped_xml,
-        STEAM_ICON_PLACEHOLDER,
-        escaped_icon_source,
-        ICON_PLACEHOLDER,
-        ICON_PLACEHOLDER,
-        ICON_PLACEHOLDER,
-        TOAST_APP_ID:gsub("'", "''"),
-        escaped_log_path,
-        TOAST_APP_ID:gsub("'", "''"),
-        escaped_title,
-        escaped_body,
-        escaped_log_path,
-        escaped_log_path,
-        escaped_ps1_path
-    )
-
-    if not write_file(ps1_path, ps_script, true) then
-        logger:error("Failed to write temporary PowerShell script")
-        return false
-    end
-
-    local powershell_path = os.getenv("SystemRoot") or "C:\\Windows"
-    powershell_path = powershell_path .. "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-    local launched, result = run_hidden_process(
-        powershell_path,
-        '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' .. ps1_path:gsub('"', '""') .. '"'
-    )
-    local log_output = ""
-
-    local log_file = io.open(log_path, "r")
-    if log_file then
-        log_output = log_file:read("*a") or ""
-        log_file:close()
-    end
-
-    remove_file(log_path)
-
-    if not launched or not os_execute_success(result) then
-        if #log_output > 0 then
-            logger:error("PowerShell notification command failed: " .. log_output:gsub("[%r\n]+", " "))
-        elseif type(result) == "string" then
-            logger:error("PowerShell notification command failed: " .. result)
-        else
-            logger:error("PowerShell notification command failed")
+        local safe_icon = sanitize_icon_source(icon_source)
+        if DEBUG_MODE then
+            local icon_kind = "none"
+            if safe_icon then
+                local lowered = safe_icon:lower()
+                if lowered:match("^data:image/") then
+                    icon_kind = "data"
+                elseif lowered:match("^https?://") then
+                    icon_kind = "remote"
+                else
+                    icon_kind = "file"
+                end
+            end
+            logger:info("toast icon kind=" .. icon_kind)
         end
-        return false
+        if safe_icon and not safe_icon:lower():match("^data:image/") then
+            table.insert(arguments, "--icon")
+            table.insert(arguments, safe_icon)
+        end
+
+        local steam_icon = steam_icon_path()
+        if file_exists(steam_icon) then
+            table.insert(arguments, "--steam-icon")
+            table.insert(arguments, steam_icon)
+        end
+
+        local ok, detail = run_process(helper, join_arguments(arguments), xml, TOAST_HELPER_WAIT_MS)
+        if ok then
+            if detail == nil then
+                logger:warn("native helper still running; assuming toast queued")
+                return true
+            end
+            if detail == 0 then
+                logger:info("toast shown via native helper")
+                return true
+            end
+
+            logger:error("native helper failed exit_code=" .. tostring(detail))
+        else
+            logger:error("native helper spawn failed: " .. tostring(detail))
+        end
     end
 
-    if log_output:find("success:toast", 1, true) then
-        logger:info("Native toast delivered")
-        return true
-    end
-
-    if log_output:find("success:fallback", 1, true) then
-        logger:info("Native fallback notification delivered")
-        return true
-    end
-
-    if #log_output > 0 then
-        logger:error("PowerShell notification command returned output: " .. log_output:gsub("[%r\n]+", " "))
-    else
-        logger:error("PowerShell notification command finished without success marker")
-    end
-
-    return false
+    return show_fallback_toast(xml)
 end
 
 function send_native_toast(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
@@ -913,15 +981,11 @@ function send_native_toast(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
     end)
 
     if not ok then
-        logger:error("send_native_toast failed unexpectedly")
-        return false
+        logger:error("send_native_toast failed unexpectedly: " .. sanitize_text(tostring(result), 200))
+        return "failure"
     end
 
-    if result == true then
-        return "success"
-    end
-
-    return "failure"
+    return result and "queued" or "failure"
 end
 
 function write_trace_log(arg1)
@@ -940,8 +1004,75 @@ function write_trace_log(arg1)
     return true
 end
 
+local function read_identity()
+    local base = os.getenv("LOCALAPPDATA") or os.getenv("TEMP") or "."
+    local file = io.open(base .. "\\SteamWindowsToastNotification\\identity.txt", "rb")
+    if not file then
+        return nil
+    end
+
+    local content = file:read("*a")
+    file:close()
+    return content
+end
+
+local function register_toast_identity()
+    local helper = resolve_helper_path()
+    if not helper then
+        return
+    end
+
+    local steam_exe = resolve_steam_exe_path()
+    if not steam_exe then
+        logger:warn("Steam executable not found; toast identity registration skipped")
+        return
+    end
+
+    local appdata = os.getenv("APPDATA")
+    local steam_shortcut = appdata
+        and (appdata .. "\\Microsoft\\Windows\\Start Menu\\Programs\\Steam.lnk")
+        or nil
+    local legacy_shortcut_a = appdata
+        and (appdata .. "\\Microsoft\\Windows\\Start Menu\\Programs\\Steam Toast Bridge.lnk")
+        or nil
+    local legacy_shortcut_b = appdata
+        and (appdata .. "\\Microsoft\\Windows\\Start Menu\\Programs\\Steam Native Toasts.lnk")
+        or nil
+
+    local expected_identity = steam_shortcut
+        and (TOAST_APP_ID .. "\n" .. steam_exe .. "\n" .. steam_shortcut)
+        or nil
+
+    if
+        expected_identity
+        and read_identity() == expected_identity
+        and file_exists(steam_icon_path())
+        and not file_exists(legacy_shortcut_a)
+        and not file_exists(legacy_shortcut_b)
+    then
+        logger:info("toast identity already registered")
+        return
+    end
+
+    local arguments = join_arguments({
+        "register",
+        "--app-id",
+        TOAST_APP_ID,
+        "--target",
+        steam_exe,
+        "--name",
+        "Steam"
+    })
+
+    -- Fire-and-forget: registration is a safety net (Steam normally ships its
+    -- own shortcut) and must not block Steam's startup for an antivirus scan.
+    local ok, detail = run_process(helper, arguments, nil, 0)
+    logger:info("toast_identity register queued=" .. tostring(ok) .. " detail=" .. tostring(detail))
+end
+
 local function on_load()
     logger:info("SteamWindowsToastNotification backend loaded")
+    register_toast_identity()
     millennium.ready()
 end
 
@@ -957,5 +1088,6 @@ return {
     on_load = on_load,
     on_unload = on_unload,
     on_frontend_loaded = on_frontend_loaded,
-    write_trace_log = write_trace_log
+    write_trace_log = write_trace_log,
+    send_native_toast = send_native_toast
 }

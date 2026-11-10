@@ -161,7 +161,7 @@ const NOTIFICATION_HOST_SELECTOR = [
 	'[data-panel*="notificationtoast" i]',
 ].join(', ');
 const STARTUP_WARMUP_WINDOW_MS = 20_000;
-const TOAST_FORWARD_MIN_GAP_MS = 80;
+const TOAST_FORWARD_MIN_GAP_MS = 0;
 const POPUP_EXTRACTION_RETRY_DELAYS_MS = [90, 150, 220, 320] as const;
 let toastForwardQueue: Promise<void> = Promise.resolve();
 let nextToastForwardEarliestMs = 0;
@@ -335,13 +335,22 @@ const firstNonGenericString = (source: RecordValue | undefined, keys: string[]):
 	return undefined;
 };
 
+const isSupportedImageSource = (value: string | undefined): boolean => {
+	const text = asString(value);
+	if (!text) {
+		return false;
+	}
+
+	return /^(https?:\/\/|data:image\/|file:\/\/)/i.test(text);
+};
+
 const profileImageUrl = (value: unknown): string | undefined => {
 	const text = asString(value);
 	if (!text) {
 		return undefined;
 	}
 
-	return /^https?:\/\//i.test(text) ? text : undefined;
+	return isSupportedImageSource(text) ? text : undefined;
 };
 
 const avatarHashToUrl = (value: unknown): string | undefined => {
@@ -388,7 +397,7 @@ const preferredAvatarUrl = (...candidates: Array<string | undefined>): string | 
 		if (!text) {
 			continue;
 		}
-		if (/^https?:\/\//i.test(text)) {
+		if (isSupportedImageSource(text)) {
 			return text;
 		}
 	}
@@ -2687,7 +2696,7 @@ const extractPopupText = (popup: unknown): PopupExtraction => {
 			if (!src) {
 				continue;
 			}
-			if (/^https?:\/\//i.test(src)) {
+			if (isSupportedImageSource(src)) {
 				icon = src;
 				break;
 			}
@@ -3916,16 +3925,30 @@ const shouldSkipDuplicateForward = (payload: NativeToastPayload, now: number): b
 const handlePopupCreated = async (popup: unknown): Promise<void> => {
 	let suppressionHandle: PopupSuppressionHandle | null = null;
 	let keepSuppressed = false;
-	const suppressNow = (): void => {
-		if (!runtimeConfig.hideSteamToast || keepSuppressed) {
-			return;
+	const ensureSuppressionHandle = (): PopupSuppressionHandle | null => {
+		if (!runtimeConfig.hideSteamToast) {
+			return null;
 		}
 
 		if (!suppressionHandle) {
 			suppressionHandle = createPopupSuppressionHandle(popup);
 		}
+		return suppressionHandle;
+	};
+	// Hide immediately so the Steam popup cannot flash while the native toast is
+	// being sent. If forwarding fails, the finally block restores it.
+	const suppressTemporarily = (): void => {
+		ensureSuppressionHandle();
+	};
+	// Keep the popup hidden after a confirmed send or a duplicate.
+	const suppressPermanently = (): void => {
+		const handle = ensureSuppressionHandle();
+		if (!handle) {
+			return;
+		}
+
 		keepSuppressed = true;
-		permanentlySuppressPopupNow(popup, suppressionHandle);
+		permanentlySuppressPopupNow(popup, handle);
 	};
 
 	try {
@@ -4154,19 +4177,22 @@ const handlePopupCreated = async (popup: unknown): Promise<void> => {
 
 		if (shouldSkipDuplicateForward(payload, now)) {
 			console.info(`[steam-native-toasts] Skipping duplicate ${summarizePayload(payload)}`);
-			suppressNow();
+			suppressPermanently();
 			return;
 		}
 
 		// When users enable popup hiding, treat it as an explicit preference:
-		// hide Steam's popup for every payload we are about to forward.
+		// hide Steam's popup while the payload is being forwarded, but restore it
+		// if the native toast fails so the notification is not lost.
 		if (runtimeConfig.hideSteamToast) {
-			suppressNow();
+			suppressTemporarily();
 		}
 
 		const forwarded = await forwardPayload(payload);
-		if (runtimeConfig.hideSteamToast && forwarded && !keepSuppressed) {
-			suppressNow();
+		if (forwarded) {
+			suppressPermanently();
+		} else {
+			console.warn('[steam-native-toasts] Native toast failed; restoring Steam popup');
 		}
 	} catch (error) {
 		console.error('[steam-native-toasts] Failed to process popup', error);

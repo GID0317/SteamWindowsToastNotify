@@ -1,0 +1,47 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Stage plugin
+        shell: pwsh
+        run: |
+          $stage = "artifact/SteamWindowsToastNotification"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item plugin.json, package.json, metadata.json, README.md, LICENSE, NOTICE -Destination $stage
+          Copy-Item backend -Destination $stage -Recurse
+          Copy-Item .millennium -Destination $stage -Recurse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SteamWindowsToastNotification
+          path: artifact/SteamWindowsToastNotification
+          if-no-files-found: error
